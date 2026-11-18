@@ -197,15 +197,33 @@ function nextWave() {
 nextWave();
 
 /* ---------- Supabase ---------- */
-function initNet() {
-  if (!SUPABASE_URL || !SUPABASE_KEY || !window.supabase) { $('net').textContent = 'Офлайн: ключи Supabase не заданы'; return; }
-  sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { realtime: { params: { eventsPerSecond: 30 } } });
+let retryN = 0, retryT = null, lastRx = performance.now();
+function connect() {
+  clearTimeout(retryT);
+  if (ch) { try { sb.removeChannel(ch); } catch (e) {} ch = null; }
+  online = false;
   ch = sb.channel('hellslash-map' + MI, { config: { broadcast: { self: false } } });
-  ch.on('broadcast', { event: 's' }, ({ payload: p }) => { pkR++; const r = remote.get(p.id) || { dx: p.x, dy: p.y }; Object.assign(r, p, { t: performance.now() }); remote.set(p.id, r); })
+  ch.on('broadcast', { event: 's' }, ({ payload: p }) => { pkR++; lastRx = performance.now(); const r = remote.get(p.id) || { dx: p.x, dy: p.y }; Object.assign(r, p, { t: performance.now() }); remote.set(p.id, r); })
     .on('broadcast', { event: 'hit' }, ({ payload: p }) => { if (p.to === me.id) hurt(p.dmg, p.from, p.nm); })
     .on('broadcast', { event: 'frag' }, ({ payload: p }) => { if (p.to === me.id) { me.kills++; toast('Вы убили: ' + p.nm); } })
-    .subscribe(s => { online = s === 'SUBSCRIBED'; });
+    .subscribe(st => {
+      online = st === 'SUBSCRIBED';
+      if (online) { retryN = 0; lastRx = performance.now(); }
+      else if (st === 'CHANNEL_ERROR' || st === 'TIMED_OUT' || st === 'CLOSED') scheduleRetry();
+    });
+}
+function scheduleRetry() {
+  clearTimeout(retryT);
+  retryT = setTimeout(connect, Math.min(1000 * 2 ** retryN++, 8000)); /* 1с, 2с, 4с, 8с, 8с… */
+}
+function initNet() {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !window.supabase) { $('net').textContent = 'Офлайн: ключи Supabase не заданы'; return; }
+  sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { realtime: { params: { eventsPerSecond: 30 }, heartbeatIntervalMs: 10000, timeout: 20000 } });
+  connect();
   loadBoard();
+  addEventListener('online', connect);                 /* вернулся интернет */
+  addEventListener('offline', () => online = false);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && !online) connect(); });
 }
 async function loadBoard() {
   try {
@@ -411,7 +429,7 @@ function update(dt) {
   });
   shots.forEach(s => { s.x += s.vx * dt; s.y += s.vy * dt; if (wall(s.x, s.y)) s.dead = 1; else if (Math.hypot(s.x - me.x, s.y - me.y) < .45) { s.dead = 1; hurt(s.d); } }); shots = shots.filter(s => !s.dead);
   const now = performance.now();
-  remote.forEach((r, id) => { if (now - r.t > 8000) remote.delete(id); else { r.dx += (r.x - r.dx) * .25; r.dy += (r.y - r.dy) * .25; } });
+  remote.forEach((r, id) => { if (now - r.t > 15000) remote.delete(id); else { r.dx += (r.x - r.dx) * .25; r.dy += (r.y - r.dy) * .25; } });
   
 }
 
@@ -458,7 +476,7 @@ function hud() { hud2();
   $('hp').firstChild.textContent = Math.max(0, me.hp | 0); $('bar').firstElementChild.style.width = Math.max(0, me.hp) + '%';
   const rows = [{ nm: me.nm, k: me.kills, me: 1 }, ...[...remote.values()].map(r => ({ nm: r.nm, k: r.k || 0 }))].sort((a, b) => b.k - a.k);
   $('sb').innerHTML = rows.map(r => `<b class="${r.me ? 'me' : ''}"><span>${esc(r.nm)}</span><span>${r.k}</span></b>`).join('');
-  if (sb) $('net').textContent = online ? `Онлайн: игроков ${remote.size + 1} (принято пакетов: ${pkR})${document.pointerLockElement === cv ? '' : '. Клик по экрану: вернуть мышь'}` : 'Подключение…';
+  if (sb) $('net').textContent = online ? `Онлайн: игроков ${remote.size + 1} (принято пакетов: ${pkR})${document.pointerLockElement === cv ? '' : '. Клик по экрану: вернуть мышь'}` : 'Переподключение…';
 }
 
 /* ---------- цикл и ввод ---------- */
@@ -496,7 +514,18 @@ $('go').onclick = () => { me.nm = ($('nm').value.trim() || 'Игрок').slice(0
 addEventListener('blur', () => Object.keys(keys).forEach(k => keys[k] = 0)); /* при смене окна отпускаем клавиши */
 /* отправка состояния по таймеру: работает, даже если вкладка в фоне */
 const sendState = () => { if (playing) send('s', { id: me.id, nm: me.nm, x: me.x, y: me.y, a: me.a, k: me.kills }); };
-setInterval(sendState, 100);
+let tick = 0;
+function onTick() {
+  sendState();
+  if (++tick % 100 === 0 && sb) {                      /* раз в ~10 с: heartbeat и проверка тишины */
+    try { sb.realtime.sendHeartbeat?.(); } catch (e) {}
+    if (online && remote.size && performance.now() - lastRx > 12000) connect();  /* соединение «зависло» */
+  }
+}
+try { /* Web Worker не замораживается в фоновой вкладке, в отличие от setInterval */
+  const w = new Worker(URL.createObjectURL(new Blob(['setInterval(()=>postMessage(0),100)'], { type: 'text/javascript' })));
+  w.onmessage = onTick;
+} catch (e) { setInterval(onTick, 100); }
 document.addEventListener('visibilitychange', sendState);
 $('mp').innerHTML = MAPS.map((m, i) => `<option value="${i}" ${i === MI ? 'selected' : ''}>Карта: ${m.n}</option>`).join('');
 $('mp').onchange = e => { location.hash = e.target.value; location.reload(); };
